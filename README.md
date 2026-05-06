@@ -12,7 +12,7 @@ pip install -r requirements.txt
 
 ## Data Download and Preprocessing
 
-To preprocess all GLUE-style language tasks used in the paper, run:
+To preprocess all language tasks and vision tasks used in the paper, run:
 
 ```bash
 python data/prepare_glue.py
