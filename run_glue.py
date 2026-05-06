@@ -16,7 +16,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    module_name = f"glue.{args.task}.{args.method}"
+    module_name = f"glues.{args.task}.{args.method}"
     module = importlib.import_module(module_name)
     module.run(args)
 
