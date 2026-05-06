@@ -533,25 +533,26 @@ def get_temperature(r, warmup_rounds, T0=0.8, Tmin=0.1, gamma=0.97):
     return max(Tmin, T0 * (gamma ** k))
 
 
-def choose_mode_softmax(SA, SB, temp=0.2, explore_p=0.05):
-    a = SA if SA is not None else 0.0
-    b = SB if SB is not None else 0.0
+def choose_mode_softmax(SA, SB, temp=0.2, explore_p=0.05, eps=1e-8):
+    if SA is None and SB is None:
+        pA = 0.5
+    elif SA is None:
+        pA = 0.0
+    elif SB is None:
+        pA = 1.0
+    else:
+        d = (SA - SB) / (abs(SA) + abs(SB) + eps)
+        x = d / max(1e-6, temp)
+        x = max(min(x, 30.0), -30.0)
+        pA = 1.0 / (1.0 + math.exp(-x))
 
     if random.random() < explore_p:
-        return "A" if random.random() < 0.5 else "B", "explore"
+        return ("A" if random.random() < 0.5 else "B"), "explore"
 
-    ea = math.exp(a / max(1e-6, temp))
-    eb = math.exp(b / max(1e-6, temp))
-    pA = ea / (ea + eb)
     return ("A" if random.random() < pA else "B"), f"soft(pA={pA:.2f})"
 
 
-def compute_mode_probs(
-    SA: float | None,
-    SB: float | None,
-    temp: float,
-    eps: float = 1e-8,
-):
+def compute_mode_probs(SA, SB, temp, eps=1e-8):
     if SA is None and SB is None:
         return 0.5, 0.5
     if SA is None:
@@ -559,18 +560,12 @@ def compute_mode_probs(
     if SB is None:
         return 1.0, 0.0
 
-    t = max(temp, eps)
-    a = SA / t
-    b = SB / t
+    d = (SA - SB) / (abs(SA) + abs(SB) + eps)
+    x = d / max(temp, eps)
+    x = max(min(x, 30.0), -30.0)
 
-    m = max(a, b)
-    ea = math.exp(a - m)
-    eb = math.exp(b - m)
-
-    Z = ea + eb
-    pA = ea / Z
-    pB = eb / Z
-
+    pA = 1.0 / (1.0 + math.exp(-x))
+    pB = 1.0 - pA
     return pA, pB
 
 
