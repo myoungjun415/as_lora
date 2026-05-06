@@ -99,7 +99,7 @@ def prepare_tinyimagenet():
         rng=rng,
     )
 
-    outdir = get_output_dir("tiny_imagenet")
+    outdir = get_output_dir("tinyimagenet")
     outdir.mkdir(parents=True, exist_ok=True)
 
     for cid, idx in enumerate(client_indices):
