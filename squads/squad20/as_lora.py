@@ -517,46 +517,40 @@ def get_temperature(r, warmup_rounds, T0=0.8, Tmin=0.1, gamma=0.97):
     return max(Tmin, T0 * (gamma ** k))
 
 
-def choose_mode_softmax(SA, SB, temp=0.2, explore_p=0.05):
-    a = SA if SA is not None else 0.0
-    b = SB if SB is not None else 0.0
+def choose_mode_softmax(SA, SB, temp=0.2, explore_p=0.05, eps=1e-8):
+    if SA is None and SB is None:
+        pA = 0.5
+    elif SA is None:
+        pA = 0.0
+    elif SB is None:
+        pA = 1.0
+    else:
+        d = (SA - SB) / (abs(SA) + abs(SB) + eps)
+        x = d / max(1e-6, temp)
+        x = max(min(x, 30.0), -30.0)
+        pA = 1.0 / (1.0 + math.exp(-x))
 
     if random.random() < explore_p:
-        return "A" if random.random() < 0.5 else "B", "explore"
+        return ("A" if random.random() < 0.5 else "B"), "explore"
 
-    ea = math.exp(a / max(1e-6, temp))
-    eb = math.exp(b / max(1e-6, temp))
-    pA = ea / (ea + eb)
     return ("A" if random.random() < pA else "B"), f"soft(pA={pA:.2f})"
 
 
-def select_param_groups_by_layer_modes(
-    model: nn.Module,
-    layer_modes: List[str],
-):
-    params_A = []
-    params_B = []
+def compute_mode_probs(SA, SB, temp, eps=1e-8):
+    if SA is None and SB is None:
+        return 0.5, 0.5
+    if SA is None:
+        return 0.0, 1.0
+    if SB is None:
+        return 1.0, 0.0
 
-    for name, p in model.named_parameters():
-        p.requires_grad = False
+    d = (SA - SB) / (abs(SA) + abs(SB) + eps)
+    x = d / max(temp, eps)
+    x = max(min(x, 30.0), -30.0)
 
-        if "lora_" not in name:
-            continue
-
-        lid = get_layer_id_from_name(name)
-        if lid is None:
-            continue
-
-        mode = layer_modes[lid]
-
-        if mode == "A" and is_lora_A(name):
-            p.requires_grad = True
-            params_A.append(p)
-        elif mode == "B" and is_lora_B(name):
-            p.requires_grad = True
-            params_B.append(p)
-
-    return params_A, params_B
+    pA = 1.0 / (1.0 + math.exp(-x))
+    pB = 1.0 - pA
+    return pA, pB
 
 
 pe_list = [PrivacyEngine() for _ in range(NUM_CLIENTS)]
