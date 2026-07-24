@@ -640,6 +640,10 @@ def train_local_steps(
         out = client.model(**batch)
         loss = out.loss
         loss.backward()
+        if not USE_DP:
+            client.clip_grads(CLIP_NORM)
+
+        client.optimizer.step()
 
         if i == steps - 1:
             layer_scores = fd_score_layerwise(
@@ -649,8 +653,6 @@ def train_local_steps(
                 fd_eps=FD_EPS,
             )
             print(f"client{client.cid} last_step_loss={loss.item():.4f}")
-
-        client.optimizer.step()
         clear_grad_samples(client.model)
 
     return layer_scores
