@@ -154,6 +154,34 @@ def build_lora_roberta_qa() -> nn.Module:
     print(f"Model params: total={total/1e6:.2f}M, trainable={trainable/1e6:.2f}M")
     return model
 
+def select_param_groups_by_layer_modes(
+    model: nn.Module,
+    layer_modes: List[str],
+):
+    params_A = []
+    params_B = []
+
+    for name, p in model.named_parameters():
+        p.requires_grad = False
+
+        if "lora_" not in name:
+            continue
+
+        lid = get_layer_id_from_name(name)
+        if lid is None:
+            continue
+
+        mode = layer_modes[lid]
+
+        if mode == "A" and is_lora_A(name):
+            p.requires_grad = True
+            params_A.append(p)
+        elif mode == "B" and is_lora_B(name):
+            p.requires_grad = True
+            params_B.append(p)
+
+    return params_A, params_B
+
 
 def get_or_create_projection(lid: int, mode: str, dim: int, device):
     key = (lid, mode, dim, str(device))
