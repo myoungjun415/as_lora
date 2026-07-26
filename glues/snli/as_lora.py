@@ -23,7 +23,7 @@ from torch.optim import SGD
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 
-
+USE_CURV = False
 USE_RANDOM_PROJ = True
 PROJ_RATIO = 1.0
 PROJ_MATS = {}
@@ -243,8 +243,12 @@ def fd_score_layerwise(
     batch: Dict[str, torch.Tensor],
     eta: float,
     fd_eps: float = FD_EPS,
+    sigma: float = 0.0,           
+    exp_bs: Optional[int] = None, 
 ):
     scores = [{"A": 0.0, "B": 0.0} for _ in range(NUM_LAYERS)]
+
+    s2 = (sigma * MAX_GRAD_NORM / exp_bs) ** 2 if (sigma > 0 and exp_bs) else 0.0
 
     for name, p in model.named_parameters():
         if p.grad is None:
@@ -260,18 +264,23 @@ def fd_score_layerwise(
         g_tilde = project_lora_gradient(name, g, lid)
         g2 = torch.sum(g_tilde * g_tilde).item()
 
+        if s2 > 0:
+            g2 = max(g2 - p.numel() * s2, 0.0)
+
         if g2 < 1e-12:
             continue
 
-        curvature = fd_curvature_for_param(
-            model=model,
-            batch=batch,
-            param_name=name,
-            projected_grad=g_tilde,
-            fd_eps=fd_eps,
-        )
-
-        score = g2 - 0.5 * eta * curvature * g2
+        if USE_CURV:
+            curvature = fd_curvature_for_param(
+                model=model,
+                batch=batch,
+                param_name=name,
+                projected_grad=g_tilde,
+                fd_eps=fd_eps,
+            )
+            score = g2 - 0.5 * eta * curvature * g2
+        else:
+            score = g2
 
         if is_lora_A(name):
             scores[lid]["A"] += score
@@ -612,12 +621,15 @@ def train_local_steps(
 
         client.optimizer.step()
 
-        if i == steps - 1:
+        if i == steps - 1:       
+            opt = client.optimizer
             layer_scores = fd_score_layerwise(
                 model=client.model,
                 batch=batch,
                 eta=eta,
                 fd_eps=FD_EPS,
+                sigma=float(getattr(opt, "noise_multiplier", 0.0) or 0.0), 
+                exp_bs=getattr(opt, "expected_batch_size", None),           
             )
             print(f"client{client.cid} last_step_loss={loss.item():.4f}")
         clear_grad_samples(client.model)
@@ -785,6 +797,8 @@ def run_federated_training(args):
     layer_mode_src = [""] * NUM_LAYERS
 
     for r in range(1, ROUNDS + 1):
+        global USE_CURV                
+        USE_CURV = (r > ROUNDS - 10)       
         if r <= warmup_rounds:
             base_mode = AB_SCHEDULE[(r - 1) % len(AB_SCHEDULE)]
             for l in range(NUM_LAYERS):
