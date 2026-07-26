@@ -248,7 +248,6 @@ def fd_score_layerwise(
 ):
     scores = [{"A": 0.0, "B": 0.0} for _ in range(NUM_LAYERS)]
 
-    # ← 추가: DP noise floor의 per-element 분산 (공개 상수만 사용)
     s2 = (sigma * MAX_GRAD_NORM / exp_bs) ** 2 if (sigma > 0 and exp_bs) else 0.0
 
     for name, p in model.named_parameters():
@@ -265,14 +264,12 @@ def fd_score_layerwise(
         g_tilde = project_lora_gradient(name, g, lid)
         g2 = torch.sum(g_tilde * g_tilde).item()
 
-        # ← 추가: noise floor debias (위치 중요 — g2 계산 직후, 필터 이전)
         if s2 > 0:
             g2 = max(g2 - p.numel() * s2, 0.0)
 
         if g2 < 1e-12:
             continue
 
-        # ← 변경: 곡률은 USE_CURV일 때만 (마지막 10라운드)
         if USE_CURV:
             curvature = fd_curvature_for_param(
                 model=model,
