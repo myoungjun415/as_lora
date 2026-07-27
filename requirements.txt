@@ -2,7 +2,7 @@ torch
 opacus
 pandas
 numpy
-transformers
+transformers==4.46.3
 peft
 evaluate
 datasets
