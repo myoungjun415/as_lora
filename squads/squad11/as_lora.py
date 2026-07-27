@@ -416,49 +416,103 @@ class SQuADClientDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_len = max_len
 
+        def _parse(x):
+            if isinstance(x, dict):
+                return x
+            try:
+                return ast.literal_eval(x)
+            except (ValueError, SyntaxError, TypeError):
+                return {"text": [], "answer_start": []}
+
+        parsed = self.df["answers"].apply(_parse)
+        self.df["answer_text"] = parsed.apply(
+            lambda a: a["text"][0] if len(a.get("text", [])) > 0 else ""
+        )
+        self.df["answer_start"] = parsed.apply(
+            lambda a: int(a["answer_start"][0]) if len(a.get("answer_start", [])) > 0 else -1
+        )
+
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        context = str(row["context"])
-        question = str(row["question"])
-        answers = _answers_from_cell(row["answers"])
+            row = self.df.iloc[idx]
 
-        ans_text = answers["text"][0] if len(answers["text"]) > 0 else ""
-        ans_start = int(answers["answer_start"][0]) if len(answers["answer_start"]) > 0 else 0
-        ans_end = ans_start + len(ans_text)
+            question = row["question"]
+            context = row["context"]
+            answer_text = row.get("answer_text", "") if hasattr(row, "get") else row["answer_text"]
+            answer_start_char = int(row["answer_start"]) if not pd.isna(row["answer_start"]) else -1
 
-        enc = self.tokenizer(
-            question,
-            context,
-            truncation="only_second",
-            max_length=self.max_len,
-            padding="max_length",
-            return_offsets_mapping=True,
-            return_tensors="pt",
-        )
+            if not isinstance(question, str):
+                question = "" if pd.isna(question) else str(question)
+            if not isinstance(context, str):
+                context = "" if pd.isna(context) else str(context)
+            if not isinstance(answer_text, str):
+                answer_text = "" if pd.isna(answer_text) else str(answer_text)
 
-        offset_mapping = enc["offset_mapping"].squeeze(0).tolist()
-        sequence_ids = enc.sequence_ids(0)
+            q_ids = self.tokenizer.encode(question, add_special_tokens=False)
+            if len(q_ids) > 64:
+                question = self.tokenizer.decode(q_ids[:64])
 
-        ctx_offsets = []
-        for off, sid in zip(offset_mapping, sequence_ids):
-            if sid != 1:
-                ctx_offsets.append((0, 0))
-            else:
-                ctx_offsets.append(tuple(off))
+            try:
+                enc = self.tokenizer(
+                    question,
+                    context,
+                    truncation="only_second",
+                    max_length=self.max_len,
+                    padding="max_length",
+                    return_tensors="pt",
+                    return_offsets_mapping=True,
+                )
+            except Exception:
+                enc = self.tokenizer(
+                    question,
+                    context,
+                    truncation="longest_first",
+                    max_length=self.max_len,
+                    padding="max_length",
+                    return_tensors="pt",
+                    return_offsets_mapping=True,
+                )
 
-        start_tok, end_tok = _char_to_token_span(ctx_offsets, ans_start, ans_end)
+            offset_mapping = enc["offset_mapping"].squeeze(0)     
+            sequence_ids = enc.sequence_ids(0)                    
 
-        if start_tok is None or end_tok is None:
-            start_tok = 0
-            end_tok = 0
+            start_tok, end_tok = 0, 0   
 
-        item = {k: v.squeeze(0) for k, v in enc.items() if k != "offset_mapping"}
-        item["start_positions"] = torch.tensor(start_tok, dtype=torch.long)
-        item["end_positions"] = torch.tensor(end_tok, dtype=torch.long)
-        return item
+            if answer_start_char >= 0 and len(answer_text) > 0:
+                answer_end_char = answer_start_char + len(answer_text)
+
+                ctx_tok_start, ctx_tok_end = None, None
+                for t, sid in enumerate(sequence_ids):
+                    if sid == 1 and ctx_tok_start is None:
+                        ctx_tok_start = t
+                    if sid == 1:
+                        ctx_tok_end = t
+
+                if ctx_tok_start is not None:
+                    ctx_first_char = offset_mapping[ctx_tok_start][0].item()
+                    ctx_last_char = offset_mapping[ctx_tok_end][1].item()
+
+                    if answer_start_char >= ctx_first_char and answer_end_char <= ctx_last_char:
+    
+                        for t in range(ctx_tok_start, ctx_tok_end + 1):
+                            s, e = offset_mapping[t].tolist()
+                            if s <= answer_start_char < e:
+                                start_tok = t
+                                break
+                     
+                        for t in range(ctx_tok_end, ctx_tok_start - 1, -1):
+                            s, e = offset_mapping[t].tolist()
+                            if s < answer_end_char <= e:
+                                end_tok = t
+                                break
+         
+
+            item = {k: v.squeeze(0) for k, v in enc.items() if k != "offset_mapping"}
+            item["start_positions"] = torch.tensor(start_tok, dtype=torch.long)
+            item["end_positions"] = torch.tensor(end_tok, dtype=torch.long)
+            return item
 
 
 def make_client_loaders(batch_size: int, max_len: int = MAX_LEN) -> List[DataLoader]:
