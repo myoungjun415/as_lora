@@ -130,7 +130,7 @@ def build_lora_vit(num_labels: int = NUM_LABELS) -> nn.Module:
         r=8,
         lora_alpha=8,
         lora_dropout=0.05,
-        target_modules=["query", "value"],
+        target_modules=["q_proj", "v_proj"],
         bias="none",
     )
     model = get_peft_model(base, lconf)
