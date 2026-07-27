@@ -84,13 +84,11 @@ def _normalize_key(key: str) -> str:
     return key
 
 
-def get_layer_id_from_name(name: str) -> Optional[int]:
+def get_layer_id_from_name(name):
     nk = _normalize_key(name)
-    parts = nk.split(".")
-    for i in range(len(parts) - 2):
-        if parts[i] == "encoder" and parts[i + 1] == "layer":
-            if parts[i + 2].isdigit():
-                return int(parts[i + 2])
+    m = re.search(r"vit\.layers\.(\d+)\.", nk)
+    if m:
+        return int(m.group(1))
     return None
 
 def is_lora_A(name: str) -> bool:
