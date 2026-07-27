@@ -23,7 +23,6 @@ from torch.optim import SGD
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForImageClassification
 
-USE_CURV = False
 USE_RANDOM_PROJ = True
 PROJ_RATIO = 1.0
 PROJ_MATS = {}
@@ -39,6 +38,10 @@ MAX_GRAD_NORM = 2.0
 DELTA = 1e-5
 
 AB_SCHEDULE = list("BA")
+
+# Curvature-based scoring only in the last N rounds; g^2-only before that.
+USE_CURV = False
+CURV_LAST_ROUNDS = 10
 
 MODEL_NAME = "google/vit-large-patch16-224-in21k"
 NUM_LABELS = 100
@@ -57,7 +60,8 @@ Tmin = 0.1
 GAMMA = 0.95
 EXPLORE_P = 0.0
 
-_LAYER_RE = re.compile(r"\bvit\.encoder\.layer\.(\d+)\.")
+# Old-style HF ViT naming (transformers <= 4.4x): vit.encoder.layer.{i}.
+_LAYER_RE = re.compile(r"encoder\.layer\.(\d+)\.")
 
 
 def seed_everything(seed: int = 42):
@@ -86,11 +90,11 @@ def _normalize_key(key: str) -> str:
 
 def get_layer_id_from_name(name):
     nk = _normalize_key(name)
-    m = re.search(r"vit\.layers\.(\d+)\.", nk)
+    m = _LAYER_RE.search(nk)
     if m:
         return int(m.group(1))
     return None
-    
+
 def is_lora_A(name: str) -> bool:
     return "lora_A" in _normalize_key(name)
 
@@ -98,8 +102,17 @@ def is_lora_B(name: str) -> bool:
     return "lora_B" in _normalize_key(name)
 
 def lora_only_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """Trainable-state dict: LoRA factors + classifier head.
+
+    The classifier is fine-tuned without LoRA (paper Appendix I.2), so it
+    must be uploaded / aggregated / broadcast alongside the LoRA weights.
+    """
     full = model.state_dict()
-    return {k: v.detach().cpu() for k, v in full.items() if "lora_" in k}
+    return {
+        k: v.detach().cpu()
+        for k, v in full.items()
+        if ("lora_" in k) or ("classifier" in k)
+    }
 
 
 def load_lora_state_dict_(model: nn.Module, lora_sd: Dict[str, torch.Tensor]):
@@ -125,15 +138,16 @@ def build_lora_vit(num_labels: int = NUM_LABELS) -> nn.Module:
 
     lconf = LoraConfig(
         r=8,
-        lora_alpha=8,
+        lora_alpha=16,
         lora_dropout=0.05,
-        target_modules=["q_proj", "v_proj"],
+        target_modules=["query", "value"],   # old-style HF ViT module names
         bias="none",
     )
     model = get_peft_model(base, lconf)
 
+    # LoRA factors + classifier head are trainable (classifier w/o LoRA).
     for name, p in model.named_parameters():
-        p.requires_grad = "lora_" in name
+        p.requires_grad = ("lora_" in name) or ("classifier" in name)
 
     trainable, total = 0, 0
     for p in model.parameters():
@@ -233,11 +247,15 @@ def fd_score_layerwise(
     batch: Dict[str, torch.Tensor],
     eta: float,
     fd_eps: float = FD_EPS,
-    sigma: float = 0.0,          
-    exp_bs: Optional[int] = None,  
+    sigma: float = 0.0,
+    exp_bs: Optional[int] = None,
 ):
     scores = [{"A": 0.0, "B": 0.0} for _ in range(NUM_LAYERS)]
 
+    # DP noise floor per element: Var[xi_i] = (sigma * C / B)^2.
+    # E||g_noisy||^2 = ||g_signal||^2 + numel * s2, so subtracting the
+    # floor gives an unbiased estimate of the signal energy. The floor
+    # uses only public DP parameters -> pure post-processing.
     s2 = (sigma * MAX_GRAD_NORM / exp_bs) ** 2 if (sigma > 0 and exp_bs) else 0.0
 
     for name, p in model.named_parameters():
@@ -254,6 +272,7 @@ def fd_score_layerwise(
         g_tilde = project_lora_gradient(name, g, lid)
         g2 = torch.sum(g_tilde * g_tilde).item()
 
+        # Analytic debias of the DP noise floor.
         if s2 > 0:
             g2 = max(g2 - p.numel() * s2, 0.0)
 
@@ -321,6 +340,14 @@ class FederatedServer:
         for sd in client_states:
             for k, v in sd.items():
                 nk = _normalize_key(k)
+
+                # Classifier head: always averaged, independent of layer modes.
+                if "classifier" in nk:
+                    if k not in agg:
+                        agg[k] = v.clone().float()
+                    else:
+                        agg[k] += v.float()
+                    continue
 
                 if "lora_" not in nk:
                     continue
@@ -494,9 +521,16 @@ def select_param_groups_by_layer_modes(
 ):
     params_A = []
     params_B = []
+    params_head = []
 
     for name, p in model.named_parameters():
         p.requires_grad = False
+
+        # Classifier head is always trained (no LoRA, no mode gating).
+        if "classifier" in name:
+            p.requires_grad = True
+            params_head.append(p)
+            continue
 
         if "lora_" not in name:
             continue
@@ -514,7 +548,7 @@ def select_param_groups_by_layer_modes(
             p.requires_grad = True
             params_B.append(p)
 
-    return params_A, params_B
+    return params_A, params_B, params_head
 
 
 pe_list = [PrivacyEngine() for _ in range(NUM_CLIENTS)]
@@ -543,7 +577,9 @@ def attach_dp_to_clients(
             lora_sd = lora_only_state_dict(client.model)
             load_lora_state_dict_(new_model, lora_sd)
 
-        params_A, params_B = select_param_groups_by_layer_modes(new_model, layer_modes)
+        params_A, params_B, params_head = select_param_groups_by_layer_modes(
+            new_model, layer_modes
+        )
 
         if len(params_A) == 0 and len(params_B) == 0:
             raise RuntimeError(f"[Client {cid}] No LoRA params selected. Check layer_modes.")
@@ -553,6 +589,9 @@ def attach_dp_to_clients(
             param_groups.append({"params": params_A, "lr": lr_a})
         if len(params_B) > 0:
             param_groups.append({"params": params_B, "lr": lr_b})
+        if len(params_head) > 0:
+            # Classifier head: trained without LoRA, jointly with adapters.
+            param_groups.append({"params": params_head, "lr": lr_a})
 
         optimizer = SGD(param_groups, weight_decay=0.0)
 
@@ -598,12 +637,12 @@ def train_local_steps(
         out = client.model(**batch)
         loss = out.loss
         loss.backward()
-        if not USE_DP:
-            client.clip_grads(CLIP_NORM)
 
-        client.optimizer.step()
+        client.optimizer.step()  # DP: p.grad <- clipped + noised gradient here
 
-        if i == steps - 1:    
+        if i == steps - 1:
+            # Score reads the *privatized* gradient (after DPOptimizer.step),
+            # so it is pure post-processing of a DP output.
             opt = client.optimizer
             layer_scores = fd_score_layerwise(
                 model=client.model,
@@ -611,9 +650,10 @@ def train_local_steps(
                 eta=eta,
                 fd_eps=FD_EPS,
                 sigma=float(getattr(opt, "noise_multiplier", 0.0) or 0.0),
-                exp_bs=getattr(opt, "expected_batch_size", None),            
-
+                exp_bs=getattr(opt, "expected_batch_size", None),
+            )
             print(f"client{client.cid} last_step_loss={loss.item():.4f}")
+
         clear_grad_samples(client.model)
 
     return layer_scores
@@ -724,8 +764,9 @@ def run_federated_training(args):
     mode_log = []
 
     for r in range(1, ROUNDS + 1):
-        global USE_CURV                 
-        USE_CURV = (r > ROUNDS - 10) 
+        global USE_CURV
+        USE_CURV = (r > ROUNDS - CURV_LAST_ROUNDS)  # curvature only in last rounds
+
         if r <= warmup_rounds:
             base_mode = AB_SCHEDULE[(r - 1) % len(AB_SCHEDULE)]
             for l in range(NUM_LAYERS):
@@ -803,12 +844,14 @@ def run_federated_training(args):
             [clients[cid].lora_state() for cid in active_ids],
             layer_modes=layer_modes,
         )
-
-        acc = evaluate_cifar100(
-            model=server.global_model,
-            loader=dev_loader,
-            device=DEVICE,
-        )
+        if r>80:
+            acc = evaluate_cifar100(
+                model=server.global_model,
+                loader=dev_loader,
+                device=DEVICE,
+            )
+        else:
+            acc=0
         best_acc = max(best_acc, acc)
 
         print(
