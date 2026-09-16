@@ -29,9 +29,6 @@ PROJ_MATS = {}
 
 NUM_LAYERS = 24
 WARMUP_FRAC = 0.1
-EMA_BETA = 0.9
-SCORE_EPS = 1e-8
-FD_EPS = 1e-3
 
 USE_DP = True
 MAX_GRAD_NORM = 2.0
@@ -39,9 +36,26 @@ DELTA = 1e-5
 
 AB_SCHEDULE = list("BA")
 
-# Curvature-based scoring only in the last N rounds; g^2-only before that.
+# Scoring is computed entirely from quantities DP-SGD has already privatized.
+#
+#   Curvature schedule: with the secant estimator the curvature term is free, so
+#   it can be used from the first round. Set CURV_START_ROUND > ROUNDS to fall
+#   back to a g^2-only run.
+#
+#   SCORE_BOTH_COMPONENTS: keep the inactive component trainable with lr = 0 so
+#       that it also receives a privatized gradient every step, giving both
+#       components a fresh g^2 term each round instead of a stale one. Note that
+#       Opacus clips on the total per-sample norm over the optimizer's
+#       parameters, so this shares the clipping budget between A and B. Set to
+#       False to reproduce the clipping behaviour of the submitted runs.
+#
+#   SECANT_DEBIAS: remove the DP noise floor from the secant numerator and
+#       denominator, using public DP constants only.
 USE_CURV = False
-CURV_LAST_ROUNDS = 10
+CURV_START_ROUND = 90
+SECANT_DEBIAS = True
+SCORE_BOTH_COMPONENTS = False
+LAMBDA_CLAMP = 20.0
 
 MODEL_NAME = "google/vit-large-patch16-224-in21k"
 NUM_LABELS = 100
@@ -197,106 +211,110 @@ def project_lora_gradient(name: str, g: torch.Tensor, lid: int) -> torch.Tensor:
     return g
 
 
-def compute_loss_no_grad(model: nn.Module, batch: Dict[str, torch.Tensor]) -> float:
-    with torch.no_grad():
-        out = model(**batch)
-        return float(out.loss.detach().float().item())
+class RoundScoreAccumulator:
+    """Per-round score statistics built from privatized gradients only.
 
+    After every local DP-SGD step, p.grad holds the clipped-and-noised gradient
+    of that step. Both terms of the score are functions of those tensors, so the
+    whole selection rule is post-processing of DP outputs and needs no forward or
+    backward pass of its own.
 
-def fd_curvature_for_param(
-    model: nn.Module,
-    batch: Dict[str, torch.Tensor],
-    param_name: str,
-    projected_grad: torch.Tensor,
-    fd_eps: float,
-) -> float:
-    params = dict(model.named_parameters())
-    if param_name not in params:
-        return 0.0
+    First-order term
+        The debiased squared norm ||g~||^2 - numel * (sigma*C/B)^2, averaged over
+        the local steps. The subtracted floor depends only on public DP
+        parameters.
 
-    p = params[param_name]
-    gnorm = projected_grad.norm().item()
-    if gnorm < 1e-12:
-        return 0.0
+    Curvature term
+        A secant estimate taken between consecutive local steps. Since SGD moves
+        the active block by da_i = -lr * g~_i,
 
-    v = projected_grad / (projected_grad.norm() + SCORE_EPS)
+            lambda = <da_i, dg_i> / ||da_i||^2
+                   = <g~_i, g~_i - g~_{i+1}> / (lr * ||g~_i||^2),
 
-    was_training = model.training
-    model.eval()
+        which needs no parameter bookkeeping at all. Both the numerator and the
+        denominator carry the same noise floor, and both are debiased with the
+        same public constant. The estimate is accumulated over the step pairs of
+        the round and reduced as a ratio of sums, which is more stable than a
+        mean of ratios.
+    """
 
-    with torch.no_grad():
-        base_loss = compute_loss_no_grad(model, batch)
+    def __init__(self, sigma: float, exp_bs: Optional[int], lr_map: Dict[str, float]):
+        self.s2 = (sigma * MAX_GRAD_NORM / exp_bs) ** 2 if (sigma > 0 and exp_bs) else 0.0
+        self.s2_secant = self.s2 if SECANT_DEBIAS else 0.0
+        self.lr_map = lr_map
 
-        p.add_(fd_eps * v)
-        plus_loss = compute_loss_no_grad(model, batch)
+        self.g2: Dict = {}
+        self.cnt: Dict = {}
+        self.num: Dict = {}
+        self.den: Dict = {}
+        self.prev: Dict[str, torch.Tensor] = {}
 
-        p.add_(-2.0 * fd_eps * v)
-        minus_loss = compute_loss_no_grad(model, batch)
+    def observe(self, model: nn.Module):
+        """Read the privatized gradients left by the last optimizer step."""
+        cur: Dict[str, torch.Tensor] = {}
 
-        p.add_(fd_eps * v)
+        for name, p in model.named_parameters():
+            if p.grad is None or "lora_" not in name:
+                continue
 
-    if was_training:
-        model.train()
+            lid = get_layer_id_from_name(name)
+            if lid is None or lid >= NUM_LAYERS:
+                continue
 
-    curvature = (plus_loss - 2.0 * base_loss + minus_loss) / (fd_eps ** 2)
-    return float(curvature)
+            comp = "A" if is_lora_A(name) else ("B" if is_lora_B(name) else None)
+            if comp is None:
+                continue
 
+            g = p.grad.detach().float()
+            g_tilde = project_lora_gradient(name, g, lid)
+            cur[name] = g_tilde
 
-def fd_score_layerwise(
-    model: nn.Module,
-    batch: Dict[str, torch.Tensor],
-    eta: float,
-    fd_eps: float = FD_EPS,
-    sigma: float = 0.0,
-    exp_bs: Optional[int] = None,
-):
-    scores = [{"A": 0.0, "B": 0.0} for _ in range(NUM_LAYERS)]
+            key = (lid, comp)
+            floor = p.numel() * self.s2
 
-    # DP noise floor per element: Var[xi_i] = (sigma * C / B)^2.
-    # E||g_noisy||^2 = ||g_signal||^2 + numel * s2, so subtracting the
-    # floor gives an unbiased estimate of the signal energy. The floor
-    # uses only public DP parameters -> pure post-processing.
-    s2 = (sigma * MAX_GRAD_NORM / exp_bs) ** 2 if (sigma > 0 and exp_bs) else 0.0
-
-    for name, p in model.named_parameters():
-        if p.grad is None:
-            continue
-        if "lora_" not in name:
-            continue
-
-        lid = get_layer_id_from_name(name)
-        if lid is None or lid >= NUM_LAYERS:
-            continue
-
-        g = p.grad.detach().float()
-        g_tilde = project_lora_gradient(name, g, lid)
-        g2 = torch.sum(g_tilde * g_tilde).item()
-
-        # Analytic debias of the DP noise floor.
-        if s2 > 0:
-            g2 = max(g2 - p.numel() * s2, 0.0)
-
-        if g2 < 1e-12:
-            continue
-
-        if USE_CURV:
-            curvature = fd_curvature_for_param(
-                model=model,
-                batch=batch,
-                param_name=name,
-                projected_grad=g_tilde,
-                fd_eps=fd_eps,
+            self.g2[key] = self.g2.get(key, 0.0) + max(
+                float(torch.sum(g_tilde * g_tilde)) - floor, 0.0
             )
-            score = g2 - 0.5 * eta * curvature * g2
-        else:
-            score = g2
+            self.cnt[key] = self.cnt.get(key, 0) + 1
 
-        if is_lora_A(name):
-            scores[lid]["A"] += score
-        elif is_lora_B(name):
-            scores[lid]["B"] += score
+            prev_g = self.prev.get(name)
+            if prev_g is not None:
+                floor_s = p.numel() * self.s2_secant
+                self.num[key] = self.num.get(key, 0.0) + (
+                    float(torch.sum(prev_g * (prev_g - g_tilde))) - floor_s
+                )
+                self.den[key] = self.den.get(key, 0.0) + (
+                    float(torch.sum(prev_g * prev_g)) - floor_s
+                )
 
-    return scores
+        self.prev = cur
+
+    def finalize(self):
+        """Return (layer_scores, lambdas)."""
+        scores = [{"A": 0.0, "B": 0.0} for _ in range(NUM_LAYERS)]
+        lambdas: Dict = {}
+
+        for (lid, comp), tot in self.g2.items():
+            n = max(self.cnt.get((lid, comp), 1), 1)
+            g2 = tot / float(n)
+            if g2 <= 0.0:
+                continue
+
+            lam = None
+            lr = self.lr_map.get(comp, 0.0)
+            if USE_CURV and lr > 0.0:
+                den = self.den.get((lid, comp), 0.0) * lr
+                if den > 1e-12:
+                    lam = self.num.get((lid, comp), 0.0) / den
+                    lam = max(-LAMBDA_CLAMP, min(LAMBDA_CLAMP, lam))
+
+            if lam is None:
+                scores[lid][comp] += g2
+            else:
+                scores[lid][comp] += g2 * (1.0 - 0.5 * lr * lam)
+                lambdas[(lid, comp)] = lam
+
+        return scores, lambdas
 
 
 @dataclass
@@ -460,12 +478,6 @@ def make_dev_loader(batch_size: int = 64) -> DataLoader:
     return DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False)
 
 
-def ema_update(prev: float | None, new: float, beta: float) -> float:
-    if prev is None:
-        return new
-    return beta * prev + (1.0 - beta) * new
-
-
 def get_temperature(r, warmup_rounds, T0=0.8, Tmin=0.1, gamma=0.97):
     if r <= warmup_rounds:
         return T0
@@ -521,6 +533,7 @@ def select_param_groups_by_layer_modes(
 ):
     params_A = []
     params_B = []
+    params_score_only = []
     params_head = []
 
     for name, p in model.named_parameters():
@@ -547,8 +560,13 @@ def select_param_groups_by_layer_modes(
         elif mode == "B" and is_lora_B(name):
             p.requires_grad = True
             params_B.append(p)
+        elif SCORE_BOTH_COMPONENTS:
+            # inactive component: trainable so DP-SGD privatizes its gradient
+            # too, but held in place by a zero learning rate
+            p.requires_grad = True
+            params_score_only.append(p)
 
-    return params_A, params_B, params_head
+    return params_A, params_B, params_head, params_score_only
 
 
 pe_list = [PrivacyEngine() for _ in range(NUM_CLIENTS)]
@@ -577,7 +595,7 @@ def attach_dp_to_clients(
             lora_sd = lora_only_state_dict(client.model)
             load_lora_state_dict_(new_model, lora_sd)
 
-        params_A, params_B, params_head = select_param_groups_by_layer_modes(
+        params_A, params_B, params_head, params_score_only = select_param_groups_by_layer_modes(
             new_model, layer_modes
         )
 
@@ -592,6 +610,8 @@ def attach_dp_to_clients(
         if len(params_head) > 0:
             # Classifier head: trained without LoRA, jointly with adapters.
             param_groups.append({"params": params_head, "lr": lr_a})
+        if len(params_score_only) > 0:
+            param_groups.append({"params": params_score_only, "lr": 0.0})
 
         optimizer = SGD(param_groups, weight_decay=0.0)
 
@@ -624,10 +644,20 @@ def train_local_steps(
     dataloader: DataLoader,
     steps: int,
     eta: float,
+    lr_map=None,
 ):
     client.model.train()
     batch_iter = _cycle(dataloader)
-    layer_scores = [{"A": 0.0, "B": 0.0} for _ in range(NUM_LAYERS)]
+
+    opt = client.optimizer
+    if lr_map is None:
+        lr_map = {"A": eta, "B": eta}
+
+    acc = RoundScoreAccumulator(
+        sigma=float(getattr(opt, "noise_multiplier", 0.0) or 0.0),
+        exp_bs=getattr(opt, "expected_batch_size", None),
+        lr_map=lr_map,
+    )
 
     for i in range(steps):
         batch = next(batch_iter)
@@ -640,22 +670,15 @@ def train_local_steps(
 
         client.optimizer.step()  # DP: p.grad <- clipped + noised gradient here
 
+        # read the privatized gradient of this step; no extra pass is needed
+        acc.observe(client.model)
+
         if i == steps - 1:
-            # Score reads the *privatized* gradient (after DPOptimizer.step),
-            # so it is pure post-processing of a DP output.
-            opt = client.optimizer
-            layer_scores = fd_score_layerwise(
-                model=client.model,
-                batch=batch,
-                eta=eta,
-                fd_eps=FD_EPS,
-                sigma=float(getattr(opt, "noise_multiplier", 0.0) or 0.0),
-                exp_bs=getattr(opt, "expected_batch_size", None),
-            )
             print(f"client{client.cid} last_step_loss={loss.item():.4f}")
 
         clear_grad_samples(client.model)
 
+    layer_scores, _ = acc.finalize()
     return layer_scores
 
 
@@ -754,8 +777,8 @@ def run_federated_training(args):
     rng = random.Random(args.seed)
     warmup_rounds = int(ROUNDS * WARMUP_FRAC)
 
-    S_A_ema = [None] * NUM_LAYERS
-    S_B_ema = [None] * NUM_LAYERS
+    S_A = [None] * NUM_LAYERS
+    S_B = [None] * NUM_LAYERS
     layer_modes = ["A"] * NUM_LAYERS
     layer_mode_src = [""] * NUM_LAYERS
 
@@ -765,7 +788,7 @@ def run_federated_training(args):
 
     for r in range(1, ROUNDS + 1):
         global USE_CURV
-        USE_CURV = (r > ROUNDS - CURV_LAST_ROUNDS)  # curvature only in last rounds
+        USE_CURV = (r >= CURV_START_ROUND)
 
         if r <= warmup_rounds:
             base_mode = AB_SCHEDULE[(r - 1) % len(AB_SCHEDULE)]
@@ -782,8 +805,8 @@ def run_federated_training(args):
             )
             for l in range(NUM_LAYERS):
                 m, tag = choose_mode_softmax(
-                    S_A_ema[l],
-                    S_B_ema[l],
+                    S_A[l],
+                    S_B[l],
                     temp=temp,
                     explore_p=EXPLORE_P,
                 )
@@ -819,6 +842,7 @@ def run_federated_training(args):
                 dataloader=dp_client_loaders[cid],
                 steps=LOCAL_STEPS,
                 eta=eta_for_score,
+                lr_map={"A": args.lr_a, "B": args.lr_b},
             )
             client_layer_scores.append(layer_scores)
 
@@ -835,23 +859,25 @@ def run_federated_training(args):
             avg_layer_scores[l]["B"] /= K
 
         for l in range(NUM_LAYERS):
-            if layer_modes[l] == "A":
-                S_A_ema[l] = ema_update(S_A_ema[l], avg_layer_scores[l]["A"], EMA_BETA)
+            if SCORE_BOTH_COMPONENTS:
+                # both components carry a fresh score this round
+                S_A[l] = avg_layer_scores[l]["A"]
+                S_B[l] = avg_layer_scores[l]["B"]
+            elif layer_modes[l] == "A":
+                S_A[l] = avg_layer_scores[l]["A"]
             elif layer_modes[l] == "B":
-                S_B_ema[l] = ema_update(S_B_ema[l], avg_layer_scores[l]["B"], EMA_BETA)
+                S_B[l] = avg_layer_scores[l]["B"]
 
         agg_state = server.aggregate_mean_layerwise(
             [clients[cid].lora_state() for cid in active_ids],
             layer_modes=layer_modes,
         )
-        if r>80:
-            acc = evaluate_cifar100(
-                model=server.global_model,
-                loader=dev_loader,
-                device=DEVICE,
-            )
-        else:
-            acc=0
+
+        acc = evaluate_cifar100(
+            model=server.global_model,
+            loader=dev_loader,
+            device=DEVICE,
+        )
         best_acc = max(best_acc, acc)
 
         print(
