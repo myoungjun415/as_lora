@@ -62,8 +62,7 @@ USE_CURV = False
 CURV_START_ROUND = 90
 SECANT_DEBIAS = True
 SCORE_BOTH_COMPONENTS = False
-LAMBDA_CLAMP = 20.0
-
+LAMBDA_CLAMP = 5.0
 MODEL_NAME = "roberta-large"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.float32
