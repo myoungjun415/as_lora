@@ -84,7 +84,7 @@ def save_clients_and_dev(clients, outdir: Path, dev_df: pd.DataFrame):
 # ======================
 def prepare_sst2():
     print("\n===== Preparing SST-2 =====")
-    ds = load_dataset("glue", "sst2")
+    ds = load_dataset("nyu-mll/glue", "sst2")
 
     train = ds["train"]
     dev = ds["validation"]
@@ -108,7 +108,7 @@ def prepare_sst2():
 
 def prepare_qqp():
     print("\n===== Preparing QQP =====")
-    ds = load_dataset("glue", "qqp")
+    ds = load_dataset("nyu-mll/glue", "qqp")
 
     train = ds["train"]
     dev = ds["validation"]
@@ -134,7 +134,7 @@ def prepare_qqp():
 
 def prepare_mnli():
     print("\n===== Preparing MNLI =====")
-    ds = load_dataset("glue", "mnli")
+    ds = load_dataset("nyu-mll/glue", "mnli")
 
     train = ds["train"]
     dev_matched = ds["validation_matched"]
@@ -170,7 +170,7 @@ def prepare_mnli():
 
 def prepare_snli():
     print("\n===== Preparing SNLI =====")
-    ds = load_dataset("snli")
+    ds = load_dataset("stanfordnlp/snli", trust_remote_code=True)
 
     train = ds["train"]
     dev = ds["validation"]
@@ -201,7 +201,7 @@ def prepare_snli():
 
 def prepare_qnli():
     print("\n===== Preparing QNLI =====")
-    ds = load_dataset("glue", "qnli")
+    ds = load_dataset("nyu-mll/glue", "qnli")
 
     train = ds["train"]
     dev = ds["validation"]
@@ -235,6 +235,10 @@ def main():
     prepare_snli()
     prepare_qnli()
     print("\nGLUE datasets are processed successfully.")
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
